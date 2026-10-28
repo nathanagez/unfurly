@@ -1,6 +1,6 @@
 [project]
 name = "unfurly"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unfurls Instagram reel links posted in Slack into a video that plays inside Slack."
 license = "MIT"
 requires-python = ">=3.14"
