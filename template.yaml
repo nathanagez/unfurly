@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Unfurls Instagram reel links posted in Slack into a video that plays inside Slack.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional custom domain for the reel player pages. Leave empty to use the CloudFront domain.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 public hosted zone of DomainName. Required when DomainName is set.
+  SlackParameterName:
+    Type: String
+    Default: /unfurly/slack
+    AllowedPattern: ^/.+
+    Description: SecureString SSM parameter holding {"slack_bot_token", "slack_signing_secret"}.
+  CloudFrontPricingPlan:
+    Type: String
+    Default: FREE
+    AllowedValues:
+      - FREE
+      - PAY_AS_YOU_GO
+    Description: FREE subscribes the distribution to the flat-rate Free plan (no overage charges).
+  UnfurlProviderName:
+    Type: String
+    Default: unfurly
+    Description: Provider name that Slack shows on each video unfurl.
+  KillSwitchInvocationThreshold:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    Description: Slack events invocations per 5 minutes that disable the Slack events function.
+
+Rules:
+  RequireUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: Deploy in us-east-1, where CloudFront requires its certificate and web ACL.
+  RequireHostedZoneWithDomain:
+    RuleCondition: !Not [!Equals [!Ref DomainName, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref HostedZoneId, ""]]
+        AssertDescription: HostedZoneId is required when DomainName is set.
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  UseFreePricingPlan: !Equals [!Ref CloudFrontPricingPlan, FREE]
+  AttachHostedZoneToPricingPlan: !And [!Condition HasCustomDomain, !Condition UseFreePricingPlan]
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures:
+      - arm64
+    CodeUri: .
+    LoggingConfig:
+      LogFormat: JSON
+      SystemLogLevel: WARN
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: unfurly
+        LOG_LEVEL: INFO
+
+Resources:
+  SlackEventsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: api.slack_events.main.lambda_handler
+      MemorySize: 512
+      Timeout: 10
+      ReservedConcurrentExecutions: 2
+      LoggingConfig:
+        LogGroup: !Ref SlackEventsLogGroup
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          SLACK_PARAMETER_NAME: !Ref SlackParameterName
+          UNFURL_REEL_FUNCTION_NAME: !Ref UnfurlReelFunction
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackParameterName}
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+        - LambdaInvokePolicy:
+            FunctionName: !Ref UnfurlReelFunction
+
+  UnfurlReelFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: workers.unfurl_reel.main.lambda_handler
+      MemorySize: 1024
+      Timeout: 120
+      ReservedConcurrentExecutions: 3
+      LoggingConfig:
+        LogGroup: !Ref UnfurlReelLogGroup
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Environment:
+        Variables:
+          SLACK_PARAMETER_NAME: !Ref SlackParameterName
+          MEDIA_BUCKET_NAME: !Ref MediaBucket
+          UNFURL_PROVIDER_NAME: !Ref UnfurlProviderName
+          PUBLIC_BASE_URL: !If
+            - HasCustomDomain
+            - !Sub https://${DomainName}
+            - !Sub https://${MediaDistribution.DomainName}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackParameterName}
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+        - S3WritePolicy:
+            BucketName: !Ref MediaBucket
+
+  KillSwitchFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      Handler: ops.kill_switch.main.lambda_handler
+      MemorySize: 128
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref KillSwitchLogGroup
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Ref SlackEventsFunction
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: lambda:PutFunctionConcurrency
+              Resource: !GetAtt SlackEventsFunction.Arn
+
+  KillSwitchAlarmPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KillSwitchFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt SlackEventsFloodAlarm.Arn
+
+  SlackEventsFloodAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Disables the Slack events function when its invocations look like a flood.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlackEventsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref KillSwitchInvocationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !GetAtt KillSwitchFunction.Arn
+
+  SlackEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /unfurly/${AWS::StackName}/slack-events
+      RetentionInDays: 1
+
+  UnfurlReelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /unfurly/${AWS::StackName}/unfurl-reel
+      RetentionInDays: 1
+
+  KillSwitchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /unfurly/${AWS::StackName}/kill-switch
+      RetentionInDays: 7
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireReelsAfterOneDay
+            Status: Enabled
+            ExpirationInDays: 1
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${MediaBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${MediaDistribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt MediaBucket.Arn
+              - !Sub ${MediaBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  MediaOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-media
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  MediaCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  MediaWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: UseFreePricingPlan
+    Properties:
+      Name: !Sub ${AWS::StackName}-media
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-media
+      Rules:
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+        - Name: AWS-AWSManagedRulesAmazonIpReputationList
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAmazonIpReputationList
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+  MediaDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        WebACLId: !If [UseFreePricingPlan, !GetAtt MediaWebAcl.Arn, !Ref AWS::NoValue]
+        Aliases: !If [HasCustomDomain, [!Ref DomainName], !Ref AWS::NoValue]
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: media-bucket
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt MediaOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: media-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref MediaCertificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+  MediaPricingPlan:
+    Type: AWS::PricingPlanManager::Subscription
+    Condition: UseFreePricingPlan
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            # note: the resource type exists in us-east-1 (describe-type), but cfn-lint's bundled spec predates it.
+            - E3006
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: FREE
+      ResourceArns:
+        - !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${MediaDistribution}
+        - !GetAtt MediaWebAcl.Arn
+        - !If
+          - AttachHostedZoneToPricingPlan
+          - !Sub arn:aws:route53:::hostedzone/${HostedZoneId}
+          - !Ref AWS::NoValue
+
+  MediaDnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Ref DomainName
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt MediaDistribution.DomainName
+        - Name: !Ref DomainName
+          Type: AAAA
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt MediaDistribution.DomainName
+
+Outputs:
+  SlackEventsRequestUrl:
+    Description: Request URL for the Slack app Event Subscriptions.
+    Value: !GetAtt SlackEventsFunctionUrl.FunctionUrl
+  PublicDomain:
+    Description: Domain that serves the player pages. Register it as a Slack app unfurl domain.
+    Value: !If [HasCustomDomain, !Ref DomainName, !GetAtt MediaDistribution.DomainName]
+  SlackParameterName:
+    Description: SSM parameter that holds the Slack credentials.
+    Value: !Ref SlackParameterName
+  SlackEventsFunctionName:
+    Description: Function that the kill switch disables, and that you re-enable afterwards.
+    Value: !Ref SlackEventsFunction

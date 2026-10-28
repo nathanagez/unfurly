@@ -1,0 +1,66 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment that holds the target AWS account settings
+        required: true
+        type: environment
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      STACK_NAME: ${{ vars.STACK_NAME || 'unfurly' }}
+      DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+      HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
+      SLACK_PARAMETER_NAME: ${{ vars.SLACK_PARAMETER_NAME || '/unfurly/slack' }}
+      CLOUDFRONT_PRICING_PLAN: ${{ vars.CLOUDFRONT_PRICING_PLAN || 'FREE' }}
+      UNFURL_PROVIDER_NAME: ${{ vars.UNFURL_PROVIDER_NAME || 'unfurly' }}
+      KILL_SWITCH_INVOCATION_THRESHOLD: ${{ vars.KILL_SWITCH_INVOCATION_THRESHOLD || '500' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: sam build
+      - run: >-
+          sam deploy
+          --stack-name "$STACK_NAME"
+          --region us-east-1
+          --resolve-s3
+          --capabilities CAPABILITY_IAM
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+          --parameter-overrides
+          DomainName="$DOMAIN_NAME"
+          HostedZoneId="$HOSTED_ZONE_ID"
+          SlackParameterName="$SLACK_PARAMETER_NAME"
+          CloudFrontPricingPlan="$CLOUDFRONT_PRICING_PLAN"
+          UnfurlProviderName="$UNFURL_PROVIDER_NAME"
+          KillSwitchInvocationThreshold="$KILL_SWITCH_INVOCATION_THRESHOLD"

@@ -1,0 +1,51 @@
+[project]
+name = "unfurly"
+version = "0.1.0"
+description = "Unfurls Instagram reel links posted in Slack into a video that plays inside Slack."
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "aws-lambda-powertools>=3.37.0",
+    "slack-sdk>=3.45.0",
+]
+
+[dependency-groups]
+dev = [
+    "boto3>=1.43.120",
+    "boto3-stubs[lambda,s3]>=1.43.119",
+    "mypy>=2.4.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+unfurl-reel = [
+    "yt-dlp>=2026.10.26",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/api", "src/workers", "src/ops", "src/shared"]
+
+[tool.uv]
+default-groups = ["dev", "unfurl-reel"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["yt_dlp", "yt_dlp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
